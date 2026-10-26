@@ -1,0 +1,174 @@
+from collections import deque
+from datetime import datetime, timezone
+import json
+import paho.mqtt.client as mqtt
+import pandas as pd
+import requests
+import xgboost as xgb
+
+# Import your local modules
+import decoder
+import storage
+
+# =========================================================================
+# 1. NETWORK & TOPIC CONFIGURATION
+# =========================================================================
+LOCAL_BROKER = "localhost"
+LOCAL_PORT = 1883
+LOCAL_TOPIC = "application/+/device/+/event/up"
+
+CLOUD_BROKER = "broker.hivemq.com"
+CLOUD_PORT = 1883
+CLOUD_TOPIC_TELEMETRY = "civilea/cloud/telemetry"
+CLOUD_TOPIC_ALERTS = "civilea/cloud/alerts"
+CLOUD_TOPIC_MAINT = "civilea/cloud/maintenance"
+
+RENDER_API_URL = "https://dam-monitor-fg5p.onrender.com/predict"
+
+# 36-step rolling buffer for 7-feature states (36 * 7 = 252 total values)
+telemetry_sequence_buffer = deque(maxlen=36)
+
+# =========================================================================
+# 2. SYSTEM INITIALIZATION
+# =========================================================================
+print("[SYSTEM] Initializing local SQLite storage...")
+storage.init_db()
+
+print("[SYSTEM] Loading XGBoost Gatekeeper Model...")
+model = xgb.XGBClassifier()
+model.load_model("fog_gatekeeper_xgboost.json")
+print("[SYSTEM] Model loaded successfully.")
+
+# Initialize Cloud MQTT Client
+cloud_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="RPi_Fog_Router")
+cloud_client.connect(CLOUD_BROKER, CLOUD_PORT, 60)
+cloud_client.loop_start()
+
+# =========================================================================
+# 3. CORE ROUTING & INFERENCE LOGIC
+# =========================================================================
+def on_message(client, userdata, msg):
+    """Triggered instantly upon receiving a local MQTT LoRaWAN packet."""
+    try:
+        payload_str = msg.payload.decode('utf-8')
+        json_data = json.loads(payload_str)
+
+        raw_base64 = json_data.get("data", json_data.get("frm_payload", ""))
+        if not raw_base64:
+            return
+
+        record = decoder.decode_lora_payload(raw_base64)
+        if record is None:
+            return
+
+        # 5 Core features for Gatekeeper Classifier
+        features = {
+            'distance_cm': record['distance_cm'],
+            'rain_raw': record['rain_raw'],
+            'flow_rate_l_min': record['flow_rate_l_min'],
+            'soil_raw': record['soil_raw'],
+            'tds_voltage': record['tds_voltage']
+        }
+        input_df = pd.DataFrame([features])
+
+        # Predict Class (0=Safe, 1=Warning, 2=Danger, 3=Fault)
+        prediction = int(model.predict(input_df)[0])
+        timestamp = datetime.now(timezone.utc).isoformat()
+        print(f"\n[{timestamp}] Payload Decoded | Station: {record['station_id']} | AI Classification: Class {prediction}")
+
+        # Save to Local SQLite Database
+        storage.save_telemetry(record, prediction)
+
+        # -----------------------------------------------------------------
+        # ROLLING SEQUENCE BUFFER & RENDER CLOUD INFERENCE
+        # -----------------------------------------------------------------
+        # Build 7-feature timestep state (ordered to match your model training sequence)
+        feature_vector_7 = [
+            float(record['distance_cm']),
+            float(record['rain_raw']),
+            float(record['flow_rate_l_min']),
+            float(record['soil_raw']),
+            float(record['tds_voltage']),
+            float(record.get('battery_v', 0.0)),  # Feature 6 (or auxiliary feature)
+            float(prediction)                      # Feature 7 (or auxiliary feature)
+        ]
+
+        telemetry_sequence_buffer.append(feature_vector_7)
+        print(f"[BUFFER] Reading cached ({len(telemetry_sequence_buffer)}/36 states)")
+
+        # Trigger Render forecast once buffer holds 36 complete timesteps (252 floats)
+        if len(telemetry_sequence_buffer) == 36:
+            flat_252_sequence = [val for timestep in telemetry_sequence_buffer for val in timestep]
+
+            render_payload = {
+                "sequence": flat_252_sequence,
+                "layer2_risk": min(prediction, 2)  # Pass risk state (0, 1, or 2)
+            }
+
+            print("[RENDER] Sending 252-feature sequence to Render API...")
+            try:
+                render_res = requests.post(RENDER_API_URL, json=render_payload, timeout=60)
+                if render_res.status_code == 200:
+                    forecast_data = render_res.json()
+                    print("[RENDER SUCCESS] Multi-step Horizon Forecast:", forecast_data)
+                else:
+                    print(f"[RENDER ERROR {render_res.status_code}]:", render_res.text)
+            except requests.exceptions.Timeout:
+                print("[RENDER TIMEOUT] Server taking long to respond (cold start).")
+            except Exception as req_err:
+                print(f"[RENDER NETWORK ERROR]: {req_err}")
+
+        # -----------------------------------------------------------------
+        # CLOUD MQTT GATEWAY PUBLISHING
+        # -----------------------------------------------------------------
+        cloud_payload = json.dumps({
+            "timestamp": timestamp,
+            "station_id": record["station_id"],
+            "telemetry": features,
+            "alerts": record["alerts"],
+            "classification": prediction
+        })
+
+        if prediction == 0:
+            print(" -> SAFE: Archived locally. Sending QoS 0 heartbeat to Cloud.")
+            cloud_client.publish(CLOUD_TOPIC_TELEMETRY, cloud_payload, qos=0)
+
+        elif prediction == 1:
+            print(" -> WARNING: Water rising. Forwarding QoS 1 telemetry to Cloud.")
+            cloud_client.publish(CLOUD_TOPIC_TELEMETRY, cloud_payload, qos=1)
+
+        elif prediction == 2:
+            print(" -> DANGER (EMERGENCY): Bursting QoS 2 stream to Alert Topic!")
+            cloud_client.publish(CLOUD_TOPIC_ALERTS, cloud_payload, qos=2)
+
+        elif prediction == 3:
+            print(" -> FAULT: Hardware glitch detected. Flagging Maintenance Topic.")
+            maint_payload = json.dumps({
+                "timestamp": timestamp,
+                "station_id": record["station_id"],
+                "error": "Sensor Fault / Out of Bounds",
+                "raw_data": features
+            })
+            cloud_client.publish(CLOUD_TOPIC_MAINT, maint_payload, qos=1)
+
+    except json.JSONDecodeError:
+        print("[Error] Failed to parse incoming MQTT JSON.")
+    except Exception as e:
+        print(f"[Error] Engine exception processing payload: {e}")
+
+# =========================================================================
+# 4. START LOCAL MQTT LISTENER
+# =========================================================================
+local_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="RPi_Local_Listener")
+local_client.on_message = on_message
+
+print(f"[SYSTEM] Connecting to Local MQTT Broker at {LOCAL_BROKER}:{LOCAL_PORT}...")
+try:
+    local_client.connect(LOCAL_BROKER, LOCAL_PORT, 60)
+    local_client.subscribe(LOCAL_TOPIC)
+    print("[SYSTEM] Fog Engine is LIVE. Listening for ESP32 edge anomalies...")
+    local_client.loop_forever()
+except KeyboardInterrupt:
+    print("\n[SYSTEM] Shutting down Fog Engine gracefully...")
+    local_client.disconnect()
+    cloud_client.disconnect()

@@ -1,0 +1,47 @@
+import base64
+import struct
+
+def decode_lora_payload(base64_str: str) -> dict | None:
+    try:
+        clean_b64 = str(base64_str).strip().strip('"').strip("'")
+        
+        # Ensure correct Base64 length padding
+        missing_padding = len(clean_b64) % 4
+        if missing_padding:
+            clean_b64 += '=' * (4 - missing_padding)
+
+        raw_bytes = base64.b64decode(clean_b64)
+
+        # Strictly check for at least 14 bytes
+        if len(raw_bytes) < 14:
+            print(f"[Decoder Error] Payload too short: expected 14 bytes, got {len(raw_bytes)}")
+            return None
+
+        # Slice the exact 14-byte C++ struct
+        payload_14bytes = raw_bytes[:14]
+
+        (
+            station_id,
+            discharge_rate_raw,
+            water_clearance_raw,
+            rain_raw,
+            soil_raw,
+            tds_v_raw,
+            ai_score_raw,
+            alerts
+        ) = struct.unpack('<BHHHHHHB', payload_14bytes)
+
+        return {
+            "station_id": int(station_id),
+            "flow_rate_l_min": float(discharge_rate_raw / 100.0),
+            "distance_cm": float(water_clearance_raw / 10.0),
+            "rain_raw": float(rain_raw),
+            "soil_raw": float(soil_raw),
+            "tds_voltage": float(tds_v_raw / 1000.0),
+            "ai_score": float(ai_score_raw / 100.0),
+            "alerts": int(alerts)
+        }
+
+    except Exception as err:
+        print(f"[Decoder Exception]: {err}")
+        return None
